@@ -1,55 +1,79 @@
 """Image viewer widget for JpgLosslessCrop.
 
-This module provides a Tkinter-based canvas widget that displays a Pillow
-image while preserving the original image data and scaling it to fit the
-current canvas size without distortion.
+This module provides a Tkinter canvas widget that displays a Pillow image,
+keeps the original image data intact, and adds scrolling support so large
+images can be navigated smoothly without zooming.
 """
 
 from __future__ import annotations
 
 from typing import Optional
 
-from PIL import Image, ImageTk
 import tkinter as tk
+from PIL import Image, ImageTk
 
 
 class ImageViewer(tk.Canvas):
-    """A canvas-based image viewer with adaptive scaling.
+    """A canvas-based image viewer with adaptive scaling and scrolling.
 
-    The viewer keeps the original Pillow image unchanged and stores the
-    currently displayed image as a Tk-compatible PhotoImage. It supports
-    resizing the canvas and recalculating the displayed image size while
-    preserving aspect ratio.
+    The viewer keeps the source Pillow image untouched and renders a resized
+    copy onto the canvas. Scrollbars are created for navigation when the
+    displayed image is larger than the visible viewport.
     """
 
     def __init__(self, master: tk.Misc, **kwargs: object) -> None:
         """Initialize the viewer widget.
 
         Args:
-            master: The parent Tk widget that will own this canvas.
+            master: The parent widget that will own the canvas.
             **kwargs: Additional keyword arguments passed to tkinter.Canvas.
         """
-        # Start with a light gray canvas background so the displayed image is
-        # easy to see when the window is larger than the content.
+        # Use a neutral background so the image has a clear visual frame.
         kwargs.setdefault("bg", "light gray")
         kwargs.setdefault("highlightthickness", 0)
 
-        # Call the parent constructor first so the canvas exists before we
-        # configure it with internal state.
+        # Create the canvas first so the rest of the viewer can attach to it.
         super().__init__(master, **kwargs)
 
-        # Keep the original Pillow image untouched for future operations.
+        # Keep the original Pillow image unchanged so the display can be
+        # regenerated from the source data whenever needed.
         self._source_image: Optional[Image.Image] = None
 
-        # Store the current zoom factor used to scale the displayed image.
+        # Store the current zoom factor used to scale the source image.
         self._zoom_factor: float = 1.0
 
-        # Store the currently displayed Tk image object.
+        # Store the most recently generated Tk image object.
         self._photo_image: Optional[ImageTk.PhotoImage] = None
 
-        # Bind resize events so the viewer can redraw when the canvas changes
-        # size at runtime.
+        # Store the canvas item id for the displayed image so it can be
+        # updated or replaced later if needed.
+        self._image_item_id: Optional[int] = None
+
+        # Create the horizontal and vertical scrollbar widgets that will let
+        # the user move around large images. They are attached directly to this
+        # canvas widget so the scrolling behavior stays self-contained.
+        self._horizontal_scrollbar = tk.Scrollbar(self, orient="horizontal")
+        self._vertical_scrollbar = tk.Scrollbar(self, orient="vertical")
+
+        # Connect the canvas to the scrollbars so they react to scrolling.
+        self.configure(
+            xscrollcommand=self._horizontal_scrollbar.set,
+            yscrollcommand=self._vertical_scrollbar.set,
+        )
+        self._horizontal_scrollbar.config(command=self.xview)
+        self._vertical_scrollbar.config(command=self.yview)
+
+        # Place the scrollbars along the lower and right edges of the canvas so
+        # they feel like part of the viewer rather than separate controls.
+        self._horizontal_scrollbar.place(relx=0.0, rely=1.0, relwidth=1.0, anchor="sw")
+        self._vertical_scrollbar.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne")
+
+        # Re-render the image whenever the visible viewport changes size.
         self.bind("<Configure>", self.on_canvas_resize)
+
+        # Add mouse-wheel based scrolling so navigation feels natural.
+        self.bind("<MouseWheel>", self._on_mouse_wheel)
+        self.bind("<Shift-MouseWheel>", self._on_mouse_wheel)
 
     def set_image(self, image: Image.Image) -> None:
         """Assign a new Pillow image to the viewer.
@@ -60,10 +84,11 @@ class ImageViewer(tk.Canvas):
         Args:
             image: A Pillow image object to display.
         """
-        # Keep the original data intact for future operations.
+        # Make a copy so the viewer owns its own source state and does not
+        # accidentally mutate the caller's image object.
         self._source_image = image.copy()
 
-        # Reset the zoom to a neutral value before computing a new fit.
+        # Reset the zoom so the next fit operation uses the current viewport.
         self._zoom_factor = 1.0
 
         # Fit the image to the current canvas size immediately.
@@ -78,25 +103,24 @@ class ImageViewer(tk.Canvas):
         if self._source_image is None:
             return
 
-        # Read the canvas dimensions. Tk may report zero width/height during
-        # initialization, in which case we cannot compute a meaningful scale.
+        # Read the canvas size. Tk may report values that are temporarily zero
+        # during initialization, so the viewer should skip fitting in that case.
         canvas_width = self.winfo_width()
         canvas_height = self.winfo_height()
         if canvas_width <= 1 or canvas_height <= 1:
             return
 
-        # Calculate the scale needed to fit the full image inside the canvas.
+        # Calculate the scale needed to fit the entire image inside the canvas.
         image_width, image_height = self._source_image.size
         width_scale = canvas_width / max(image_width, 1)
         height_scale = canvas_height / max(image_height, 1)
         self._zoom_factor = min(width_scale, height_scale)
 
-        # Ensure the image is not scaled up beyond its natural size when the
-        # canvas is large. This keeps the display stable and avoids unnecessary
-        # enlargement.
+        # Avoid scaling the image up beyond its natural size when the viewport
+        # is much larger than the source image.
         self._zoom_factor = max(self._zoom_factor, 0.1)
 
-        # Redraw using the newly calculated zoom ratio.
+        # Redraw using the newly calculated zoom factor.
         self.redraw()
 
     def redraw(self) -> None:
@@ -104,10 +128,13 @@ class ImageViewer(tk.Canvas):
 
         The method resizes the source image using Pillow's LANCZOS filter,
         converts it to a Tk-compatible image, and draws it at the top-left
-        corner of the canvas.
+        corner of the canvas. The scroll region is updated so the image can be
+        navigated when it exceeds the viewport.
         """
         if self._source_image is None:
             self.delete("all")
+            self._image_item_id = None
+            self._update_scrollbars()
             return
 
         # Clear any existing canvas content before drawing the new image.
@@ -128,18 +155,28 @@ class ImageViewer(tk.Canvas):
         self._photo_image = ImageTk.PhotoImage(resized_image)
 
         # Draw the image at the top-left corner of the canvas.
-        self.create_image(0, 0, anchor="nw", image=self._photo_image)
+        self._image_item_id = self.create_image(
+            0,
+            0,
+            anchor="nw",
+            image=self._photo_image,
+        )
+
+        # Update the scrollbar state and the scroll region after drawing.
+        self._update_scroll_region()
+        self._update_scrollbars()
 
     def on_canvas_resize(self, event: tk.Event[object]) -> None:
         """Handle canvas resize events by redrawing the current image.
 
-        When the canvas dimensions change, the viewer recomputes the size using
-        the existing zoom factor so the image remains visible and proportionate.
+        When the canvas dimensions change, the viewer redraws the current image
+        so the visible portion stays appropriately scaled and the scroll region
+        remains consistent with the new viewport.
 
         Args:
             event: The Tkinter resize event object.
         """
-        # Ignore events that do not provide meaningful canvas dimensions.
+        # Ignore events that do not provide a meaningful viewport size.
         if event.width <= 1 or event.height <= 1:
             return
 
@@ -147,3 +184,75 @@ class ImageViewer(tk.Canvas):
         # canvas dimensions. The current zoom reflects the previous fit and is
         # reused so the image size remains stable unless a new image is loaded.
         self.redraw()
+
+    def _update_scroll_region(self) -> None:
+        """Set the canvas scroll region based on the displayed image size."""
+        if self._image_item_id is None:
+            self.configure(scrollregion=(0, 0, 0, 0))
+            return
+
+        # Use the rendered image dimensions to define the scrollable surface.
+        image_bbox = self.bbox(self._image_item_id)
+        if image_bbox is None:
+            self.configure(scrollregion=(0, 0, 0, 0))
+            return
+
+        # The bounding box includes the image position and size. This gives us a
+        # reliable scroll region that matches the rendered content.
+        left, top, right, bottom = image_bbox
+        self.configure(scrollregion=(0, 0, max(right, 1), max(bottom, 1)))
+
+    def _update_scrollbars(self) -> None:
+        """Enable or disable the scrollbars depending on the image size."""
+        canvas_width = max(self.winfo_width(), 1)
+        canvas_height = max(self.winfo_height(), 1)
+        image_width = int(self._source_image.size[0] * self._zoom_factor) if self._source_image is not None else 0
+        image_height = int(self._source_image.size[1] * self._zoom_factor) if self._source_image is not None else 0
+
+        # If the image is smaller than the visible canvas, the viewport does not
+        # need to scroll and the scrollbars should return to the start.
+        if image_width <= canvas_width:
+            self.xview_moveto(0.0)
+            self._horizontal_scrollbar.configure(state="disabled")
+        else:
+            self._horizontal_scrollbar.configure(state="normal")
+
+        if image_height <= canvas_height:
+            self.yview_moveto(0.0)
+            self._vertical_scrollbar.configure(state="disabled")
+        else:
+            self._vertical_scrollbar.configure(state="normal")
+
+    def _on_mouse_wheel(self, event: tk.Event[object]) -> str:
+        """Scroll the canvas vertically or horizontally with the mouse wheel.
+
+        Windows-style behavior is used: the vertical wheel scrolls content up and
+        down, while Shift + wheel scrolls horizontally.
+
+        Args:
+            event: The Tkinter mouse-wheel event object.
+
+        Returns:
+            A Tkinter event break string to prevent the default browser-like
+            scrolling behavior from interfering with the viewer.
+        """
+        # The wheel delta is usually expressed in units of 120. The sign tells
+        # us the direction of the movement.
+        delta = getattr(event, "delta", 0)
+        if delta == 0:
+            if getattr(event, "num", 0) == 4:
+                delta = 120
+            elif getattr(event, "num", 0) == 5:
+                delta = -120
+
+        # Shift + wheel is treated as horizontal movement, while plain wheel is
+        # vertical movement.
+        if event.state & 0x1:
+            direction = -1 if delta > 0 else 1
+            self.xview_scroll(direction, "units")
+        else:
+            direction = -1 if delta > 0 else 1
+            self.yview_scroll(direction, "units")
+
+        # Return "break" so the event does not propagate to other widgets.
+        return "break"
