@@ -75,6 +75,14 @@ class ImageViewer(tk.Canvas):
         self.bind("<MouseWheel>", self._on_mouse_wheel)
         self.bind("<Shift-MouseWheel>", self._on_mouse_wheel)
 
+        # Bind keyboard shortcuts for zooming so the viewer can be controlled
+        # without using a mouse or toolbar. The explicit key-press bindings
+        # make the shortcuts easier to extend later if more controls are added.
+        self.bind(",", self._on_zoom_out)
+        self.bind(".", self._on_zoom_in)
+        self.bind("<KeyPress-comma>", self._on_zoom_out)
+        self.bind("<KeyPress-period>", self._on_zoom_in)
+
     def set_image(self, image: Image.Image) -> None:
         """Assign a new Pillow image to the viewer.
 
@@ -256,3 +264,49 @@ class ImageViewer(tk.Canvas):
 
         # Return "break" so the event does not propagate to other widgets.
         return "break"
+
+    def _on_zoom_in(self, event: tk.Event[object]) -> str:
+        """Increase the zoom level by 25% while preserving the current view."""
+        self._change_zoom(1.25)
+        return "break"
+
+    def _on_zoom_out(self, event: tk.Event[object]) -> str:
+        """Decrease the zoom level by 25% while preserving the current view."""
+        self._change_zoom(0.75)
+        return "break"
+
+    def _change_zoom(self, factor: float) -> None:
+        """Adjust the zoom level while maintaining the visible center point.
+
+        The current viewport is preserved as much as possible by keeping the
+        canvas coordinates under the cursor centered after the redraw.
+
+        Args:
+            factor: The zoom multiplier applied to the current zoom level.
+        """
+        if self._source_image is None:
+            return
+
+        # Keep the zoom within the supported bounds.
+        new_zoom = self._zoom_factor * factor
+        self._zoom_factor = min(max(new_zoom, 0.10), 16.00)
+
+        # Preserve the current view by tracking the visible center in canvas
+        # coordinates before redrawing, then restoring that position after the
+        # image is re-rendered. The calculations are kept explicit so future
+        # maintainers can adjust the behavior more easily.
+        viewport_center_x = self.canvasx(self.winfo_width() / 2)
+        viewport_center_y = self.canvasy(self.winfo_height() / 2)
+
+        self.redraw()
+
+        # Adjust the scroll position so the same viewport center remains in view.
+        bbox = self.bbox("all")
+        if bbox is None:
+            return
+
+        _, _, content_width, content_height = bbox
+        if content_width > 1:
+            self.xview_moveto(max(0.0, min(1.0, viewport_center_x / content_width)))
+        if content_height > 1:
+            self.yview_moveto(max(0.0, min(1.0, viewport_center_y / content_height)))
