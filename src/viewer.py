@@ -12,13 +12,16 @@ from typing import Optional
 import tkinter as tk
 from PIL import Image, ImageTk
 
+from src.crop_rectangle import CropRectangle
+
 
 class ImageViewer(tk.Canvas):
     """A canvas-based image viewer with adaptive scaling and scrolling.
 
     The viewer keeps the source Pillow image untouched and renders a resized
     copy onto the canvas. Scrollbars are created for navigation when the
-    displayed image is larger than the visible viewport.
+    displayed image is larger than the visible viewport. The widget can also
+    overlay a first-pass crop rectangle for future editing workflows.
     """
 
     def __init__(self, master: tk.Misc, **kwargs: object) -> None:
@@ -48,6 +51,14 @@ class ImageViewer(tk.Canvas):
         # Store the canvas item id for the displayed image so it can be
         # updated or replaced later if needed.
         self._image_item_id: Optional[int] = None
+
+        # Keep the crop overlay state in a dedicated model object so it can be
+        # extended later without changing the viewer's public API.
+        self._crop_rectangle: CropRectangle = CropRectangle()
+
+        # Track the canvas item ids that belong to the crop overlay so they can
+        # be safely cleared and redrawn whenever the image is re-rendered.
+        self._crop_overlay_item_ids: list[int] = []
 
         # Create the horizontal and vertical scrollbar widgets that will let
         # the user move around large images. They are attached directly to this
@@ -82,6 +93,10 @@ class ImageViewer(tk.Canvas):
         self.bind(".", self._on_zoom_in)
         self.bind("<KeyPress-comma>", self._on_zoom_out)
         self.bind("<KeyPress-period>", self._on_zoom_in)
+        self.bind("q", self._toggle_crop_rectangle)
+        self.bind("Q", self._toggle_crop_rectangle)
+        self.bind("<KeyPress-q>", self._toggle_crop_rectangle)
+        self.bind("<KeyPress-Q>", self._toggle_crop_rectangle)
 
     def set_image(self, image: Image.Image) -> None:
         """Assign a new Pillow image to the viewer.
@@ -142,6 +157,8 @@ class ImageViewer(tk.Canvas):
         if self._source_image is None:
             self.delete("all")
             self._image_item_id = None
+            self._crop_rectangle.visible = False
+            self._update_crop_overlay()
             self._update_scrollbars()
             return
 
@@ -169,6 +186,10 @@ class ImageViewer(tk.Canvas):
             anchor="nw",
             image=self._photo_image,
         )
+
+        # Rebuild the crop overlay after the image has been re-rendered so it
+        # stays aligned with the current visible image size.
+        self._update_crop_overlay()
 
         # Update the scrollbar state and the scroll region after drawing.
         self._update_scroll_region()
@@ -310,3 +331,94 @@ class ImageViewer(tk.Canvas):
             self.xview_moveto(max(0.0, min(1.0, viewport_center_x / content_width)))
         if content_height > 1:
             self.yview_moveto(max(0.0, min(1.0, viewport_center_y / content_height)))
+
+    def _update_crop_overlay(self) -> None:
+        """Draw or clear the crop rectangle overlay for the current image.
+
+        The overlay is drawn in canvas coordinates so it stays visually attached
+        to the image even when the view is scrolled, zoomed, or the window is
+        resized. The logic is intentionally simple because editing is still
+        disabled and this first version only needs to show the selection.
+        """
+        # Remove any previously drawn overlay items so the canvas stays in sync
+        # with the current image size and visibility state.
+        for item_id in self._crop_overlay_item_ids:
+            self.delete(item_id)
+        self._crop_overlay_item_ids.clear()
+
+        # If the crop rectangle is hidden, there is nothing to draw.
+        if not self._crop_rectangle.visible or self._source_image is None:
+            return
+
+        # The rectangle should cover the full currently displayed image. The
+        # scaled dimensions are derived directly from the current zoom factor so
+        # the overlay keeps pace with the visible content.
+        image_width, image_height = self._source_image.size
+        scaled_width = max(1, int(image_width * self._zoom_factor))
+        scaled_height = max(1, int(image_height * self._zoom_factor))
+
+        # Reset the crop rectangle to the full-image bounds so the overlay always
+        # starts from a coherent state when the user shows it.
+        self._crop_rectangle.left = 0
+        self._crop_rectangle.top = 0
+        self._crop_rectangle.right = scaled_width
+        self._crop_rectangle.bottom = scaled_height
+        self._crop_rectangle.selected = False
+        self._crop_rectangle.aspect_ratio = None
+
+        # Draw the outline of the crop rectangle using the required cyan color
+        # and a thin 2-pixel border.
+        outline_id = self.create_rectangle(
+            self._crop_rectangle.left,
+            self._crop_rectangle.top,
+            self._crop_rectangle.right,
+            self._crop_rectangle.bottom,
+            outline="cyan",
+            width=2,
+        )
+        self._crop_overlay_item_ids.append(outline_id)
+
+        # Add the four resize handles in the corners. They are intentionally
+        # non-interactive at this stage, so they only communicate the selection
+        # region and keep the initial visual experience simple.
+        handle_size = 8
+        half_size = handle_size // 2
+        handle_positions = [
+            (self._crop_rectangle.left, self._crop_rectangle.top),
+            (self._crop_rectangle.right, self._crop_rectangle.top),
+            (self._crop_rectangle.left, self._crop_rectangle.bottom),
+            (self._crop_rectangle.right, self._crop_rectangle.bottom),
+        ]
+        for x_position, y_position in handle_positions:
+            handle_id = self.create_rectangle(
+                x_position - half_size,
+                y_position - half_size,
+                x_position + half_size,
+                y_position + half_size,
+                fill="white",
+                outline="black",
+                width=1,
+            )
+            self._crop_overlay_item_ids.append(handle_id)
+
+    def _toggle_crop_rectangle(self, event: tk.Event[object]) -> str:
+        """Show or hide the crop rectangle overlay.
+
+        The rectangle is intended to be purely visual at this stage, so this
+        method only toggles the overlay state and redraws it without enabling
+        any editing behavior such as drag, move, or resize.
+
+        Args:
+            event: The Tkinter keyboard event object.
+
+        Returns:
+            A Tkinter event break string to prevent the keypress from falling
+            through to any other handlers.
+        """
+        # Toggle the visibility flag and rebuild the overlay so the rectangle
+        # appears immediately when the shortcut is used.
+        self._crop_rectangle.visible = not self._crop_rectangle.visible
+        if self._crop_rectangle.visible:
+            self._crop_rectangle.selected = True
+        self.redraw()
+        return "break"
